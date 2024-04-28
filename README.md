@@ -26,7 +26,7 @@
 
 ## 那就开始吧
 
-知行合一，万事开头难，那就边做边想吧。  
+万事开头难，那就边做边想吧。  
 
 ### 创建rust项目
 
@@ -67,6 +67,7 @@ pub mod kv;
 // kv.rs
 use std::io;
 
+/// KvStore, 存储键值对的上下文结构体
 struct KvStore {
 
 }
@@ -78,3 +79,474 @@ impl KvStore {
     }
 }
 ```
+
+### 添加crate
+
+接下来就是在调用set方法时，需要把set指令给封装成一个结构体，这样可以更加方便的序列化到文件中，序列化的库当然应该就是serde了吧。还有命令行工具clap。在控制台执行： 
+```shell
+cargo add serde serde_json clap
+```
+并在features添加derive。就像这样：
+```toml
+# Cargo.toml
+
+...省略...
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+serde = { version="1.0.198", features=["derive"] }
+serde_json = "1.0.116"
+```
+期望中的命令结构体大概是这样的：
+```rust
+// kv/command.rs
+use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+pub struct Cli {
+  #[command(subcommand)]
+  pub command: Command,
+}
+
+
+#[derive(Subcommand, Serialize, Deserialize, Debug)]
+pub enum Command {
+  Set {
+    /// key
+    key: String,
+    /// value
+    value: String,
+  },
+  Get {
+    /// key
+    key: String,
+  },
+  Remove {
+    /// key
+    key: String,
+  }
+}
+```
+命令行的解析的main文件中处理下：
+```rust
+// main.rs
+use clap::Parser;
+use kv::kv::command::{Cli, Command};
+
+fn main() {
+    let cli = Cli::parse();
+
+   match cli.command {
+    Command::Set { key, value } => todo!(),
+    Command::Get { key } => todo!(),
+    Command::Remove { key } => todo!(),
+   }
+}
+```
+
+现在执行一下cargo run看下效果吧。
+```shell
+cargo run -- --help
+
+warning: `kv` (bin "kv") generated 4 warnings (run `cargo fix --bin "kv"` to apply 4 suggestions)
+    Finished dev [unoptimized + debuginfo] target(s) in 5.63s
+     Running `target/debug/kv --help`
+Usage: kv <COMMAND>
+
+Commands:
+  set     
+  get     
+  remove  
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+> 好了，架子大概应该可能也许就这样了，对于我这样一下纯野生的Rustacean，内心也是比较忐忑，也不知这样写道对不对，算了，就这样向下写吧。  
+
+### set方法
+
+还是继续接着set方法往下写。  
+如果生写，大概就是这样的，倒是也比较简单清晰。  
+```rust
+  pub fn set(&mut self, key: String, value: String) -> Result<usize> {
+    // 命令实例
+    let set_cmd = Command::Set { key, value };
+    // 当前项目路径
+    let cur_dir = current_dir()?;
+    // 数据文件路径
+    let data_file_path = cur_dir.join("data.log".to_string());
+    // 数据文件实例
+    let data_file = File::open(data_file_path)?;
+    // bufferWriter
+    let writer = BufWriter::new(data_file);
+    // 写入json
+    serde_json::to_writer(writer, &set_cmd)?;
+
+    Ok(serde_json::to_string(&set_cmd)?.len())
+  }
+```
+再测试一下：
+```rust
+  #[test]
+  fn test_set() -> Result<()> {
+    let mut kvs = KvStore{};
+    let len = kvs.set("key".to_string(), "value".to_string())?;
+    assert_ne!(0, len);
+    Ok(())
+  }
+```
+
+执行了一下测试方法，果不其然，没有通过，但是错误信息也是非常直观的，它告诉我，没有这样的文件路径：
+```txt
+---- kv::tests::test_set stdout ----
+Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+
+
+failures:
+    kv::tests::test_set
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p kv --lib`
+
+ *  The terminal process "cargo 'test', '--package', 'kv', '--lib', '--', 'kv::tests::test_set', '--exact', '--show-output'" terminated with exit code: 101. 
+ *  Terminal will be reused by tasks, press any key to close it. 
+```
+那就给它创建一个文件不就行了么，真是个小聪明，这样改一下：
+```rust
+// 数据文件实例
+let data_file = File::open(&data_file_path).unwrap_or(File::create(data_file_path)?);
+```
+再执行一下测试方法，这次就通过了。
+```txt
+   Compiling kv v0.1.0 (/Users/yuandashuai/Documents/yds/vscode-rust-space/rust-practice/kv)
+    Finished test [unoptimized + debuginfo] target(s) in 0.75s
+     Running unittests src/lib.rs (target/debug/deps/kv-18d9b559d3ffc8da)
+
+running 1 test
+test kv::tests::test_set ... ok
+
+successes:
+
+successes:
+    kv::tests::test_set
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+顺带要检查下data.log这个文件，里面的内容是不是我们期望的json数据。
+```json
+// data.log
+{"Set":{"key":"key","value":"value"}}
+```
+
+### 重构它
+
+很明显的，不能这样生写，得想办法让它更加的结构化，更加的优雅。  
+KvStore这个结构体之所以被称之主为上下文对象，它应该有一些内置属性或方法，比如：数据文件的读写操作，将set进来或从文件读到的数据的索引给保存在内存中。  
+数据索引的话就直接用BTreeMap吧，结构就是`(key: 键, data: (数据文件名, 命令数据范围(开始位置, 结束位置)))`这样式儿的，目前大概就是这些吧。搞下试试。  
+定义一个数据索引的结构体：
+```rust
+pub struct CmdIdx {
+  // 索引所在的数据文件
+  pub file: u32,
+  // 数据开始位置
+  pub pos: u64,
+  // 数据长度
+  pub len: u64,
+}
+
+type Idx =(u32, Range<u64>); 
+
+impl From<Idx> for CmdIdx {
+    fn from((file, range): Idx) -> Self {
+      CmdIdx {file, pos: range.start, len: range.end - range.start} 
+    }
+} 
+```
+改完的KvStore大概就是这个样子：
+```rust
+struct KvStore {
+  // 数据文件的位置
+  data_path: PathBuf,
+
+  // 当前正在操作的数据文件
+  // 数据文件的命名方式使用数字递增的方式 1.log, 2.log, 3.log。。。
+  cur_data_file_name: u32,
+
+  // 当前数据文件的writer
+  writer: BufWriter<File>,
+
+  // 数据文件路径下所有文件reader
+  // 使用hashmap来存，key: 文件名, value: writer
+  readers: HashMap<u32, BufReader<File>>,
+
+  // 数据索引
+  index: BTreeMap<String, CmdIdx>
+}
+```
+再给它加个open方法，相当于初始化它：
+```rust
+  // 初始化KvStore
+  pub fn open() -> Result<KvStore> {
+    // 数据文件路径
+    // current_dir/data
+    let data_path = data_dir()?;
+
+    // 创建目录
+    create_dir_all(&data_path)?;
+
+    // 读取数据文件目录所有的文件，
+    // 过滤，只要.log结尾的文件
+    // 只要数字开头的文件
+    let mut file_names: Vec<u32> = read_dir(&data_path)?
+      // 展开PathBuf
+      .flat_map(|res| Ok(res?.path()) as Result<PathBuf>)
+      // 过滤出.log文件 
+      .filter(|res| res.is_file() && res.extension() == Some("log".as_ref()))
+      // 从路径中取出文件名
+      .flat_map(|res| {
+        res
+          // 文件名
+          .file_name()
+          // 转系统字符
+          .and_then(OsStr::to_str)
+          // 去掉后缀
+          .map(|res| res.trim_end_matches(".log"))
+          // 转u32
+          .map(str::parse::<u32>)
+      })
+      // 展开
+      .flatten()
+      .collect();
+
+      // 文件名数字排序
+      file_names.sort();
+
+      // 当前正在操作的数据文件名，从所有的文件中取出最大的，+1。
+      let cur_data_file_name = file_names.last().unwrap_or(&0) + 1;
+      // 文件路径
+      let cur_data_file_path = data_path.join(format!("{}.log", cur_data_file_name));
+
+      // writer, 文件已经创建
+      let writer = BufWriter::new(
+        OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .append(true)
+        .open(&cur_data_file_path)?
+      );
+
+      // writers
+      let mut readers = HashMap::new();
+      readers.insert(cur_data_file_name, BufReader::new(File::open(cur_data_file_path)?));
+
+      // 内存中的数据索引
+      let mut index = BTreeMap::new();
+
+      // 从所有的数据文件中加载数据到索引中
+      for file_name in file_names {
+        // 每个文件的reader
+        let file_path = data_path.join(format!("{}.log", file_name));
+        let file = File::open(file_path)?;
+        let mut file_reader = BufReader::new(file);
+      
+        // 从文件开始位置读
+        let mut start_pos = file_reader.seek(SeekFrom::Start(0))?;
+        // 按Command的json格式读
+        let mut from_reader = Deserializer::from_reader(file_reader.by_ref()).into_iter::<Command>();
+        while let Some(cmd) = from_reader.next() {
+          // command的结束位置
+          let end_pos = from_reader.byte_offset() as u64;
+          match cmd? {
+
+            // 匹配到set命令
+            Command::Set { key, .. } => {
+              let cmd_index: CmdIdx = (file_name, Range {start: start_pos, end: end_pos}).into();
+              let _ = &index.insert(key, cmd_index);
+            },
+
+            // 匹配到remove命令
+            Command::Remove { key } => todo!(),
+
+            // get命令不会在数据文件中
+            _ => (),
+          }
+          // 开始位置就是下个命令的结束位置
+          start_pos = end_pos;
+        }
+        readers.insert(file_name, file_reader);
+      }
+
+    // 返回
+    Ok(KvStore {
+        data_path,
+        cur_data_file_name,
+        writer,
+        readers,
+        index,
+    })
+  }
+```
+set方法我们也要改一下：
+```rust
+  /// set
+  pub fn set(&mut self, key: String, value: String) -> Result<()> {
+    // set命令对象
+    let cmd = Command::Set { key, value };
+
+    // 写入json到文件
+    serde_json::to_writer(self.writer.get_ref(), &cmd)?;
+    self.writer.flush()?;
+
+    // 将数据插入到内存索引中
+    if let Command::Set { key, .. } = cmd {
+      self.index.insert(key, (self.cur_data_file_name, 0..0).into());
+    }
+    
+    Ok(())
+  }
+```
+当开始重新写这个set方法时我意识到了问题，那就是在将数据插入到内存索引中去的时候，这里并不能非常直观的获取到数据索引的开始位置和结束位置，虽然说也有其它办法能获取到，比如重新读这个文件，能轻易的获取到这些数据，但是这样做会不会有点太繁杂了呢，还是那名话，需要想个办法，让它更加结构化，更加优雅一点。那么该怎么做呢。  
+什么情况下需要去获取数据索引的位置呢？
+1. 写文件，将数据索引保存在内存中。
+2. 读文件，加载数据文件时，需要从数据文件回放数据，然后将数据索引保存在内存中。  
+
+加载文件时，因为是正在读文件，所以获取数据的位置是很容易的，到目前为止应该是不用特别处理。但是写文件不一样，这里要做的就是在每次写入的时候，把写入后的位置给保存下来。
+
+把writer拿出来单独封装：
+```rust
+use std::io::{BufWriter, Result, Seek, SeekFrom, Write};
+
+/// 就如effective rust里说的那样，远离过度优化的诱惑，其实File已经实现了Write 和 Seek，我觉得完全可以代替bufwriter,但既然是在练习rust，能多写点就多写点吧。
+pub struct WriterWithPos<W: Write + Seek> {
+
+  // 提供写功能的对象其实还是BufWriter
+  writer: BufWriter<W>,
+
+  // 每次写完的位置
+  pub pos: u64,
+}
+
+impl<W: Write + Seek> WriterWithPos<W> {
+  pub fn new(mut inner: W) -> Result<Self> {
+
+    // 接受一个实现Write 和 Seek接口的对象，指针调整到最后位置，后写入的数据依次累加进来
+    let pos = inner.seek(SeekFrom::End(0))?;
+
+    // 提供写功能的对象其实还是BufWriter
+    Ok(WriterWithPos {
+      writer: BufWriter::new(inner),
+      pos,
+    })
+  }
+}
+
+impl<W: Write + Seek> Write for WriterWithPos<W> {
+  fn write(&mut self, buf: &[u8]) -> Result<usize> {
+
+    // 写入的数据长度
+    let write_len = self.writer.write(buf)?;
+    // 累加到写入文件的位置上
+    self.pos += write_len as u64;
+
+    Ok(write_len)
+  }
+
+  fn flush(&mut self) -> Result<()> {
+    self.writer.flush()?;
+    Ok(())
+  }
+}
+```
+
+然后set方法就可以这样来写了： 
+```rust
+  /// set
+  pub fn set(&mut self, key: String, value: String) -> Result<()> {
+    // set命令对象
+    let cmd = Command::Set { key, value };
+
+    // 数据开始位置
+    let start = self.writer.pos;
+
+    // 写入json到文件
+    serde_json::to_writer(self.writer.by_ref(), &cmd)?;
+    self.writer.flush()?;
+
+    // 数据结束位置
+    let end = self.writer.pos;
+
+    // 将数据插入到内存索引中
+    if let Command::Set { key, .. } = cmd {
+      self.index.insert(key, (self.cur_data_file_name, (start..end)).into());
+    }
+    
+    Ok(())
+  }
+}
+```
+
+在写这些东西的时候，本人也毕竟还只在学习rust没几天，本职是做java开发的，得益于rust方便的测试环境，我可以在很多库不熟悉的情况下，写一些单元测试来验证它，同时，这对学习rust的标准库有很大的帮助，尽管写的测试代码并不是那么符合单元测试的规范。
+
+```rust
+#[cfg(test)]
+mod tests {
+
+  #[test]
+  fn test_seek() -> io::Result<()> {
+    let mut file = File::open(current_dir()?.join("data.log"))?;
+    let seek_end = file.seek(io::SeekFrom::End(0))?;
+    let seek_start = file.seek(io::SeekFrom::Start(0))?;
+    let seek_cur = file.seek(io::SeekFrom::Current(0))?;
+
+    println!("seek start: {}, end: {}, current: {}", seek_start, seek_end, seek_cur);
+
+    Ok(())
+  }
+
+ #[test]
+  fn test_open_set() -> Result<()> {
+    let mut open = KvStore::open()?;
+
+    open.set("foo".to_string(), "bar".to_string());
+    assert_eq!(1, open.index.len());
+    open.set("foo1".to_string(), "bar1".to_string());
+    assert_eq!(2, open.index.len());
+    open.set("foo2".to_string(), "bar2".to_string());
+    assert_eq!(3, open.index.len());
+    Ok(())
+  }
+}
+```
+
+执行一下`test_open_set`的测试方法，该测试在我的环境下确实是通过了：
+```txt
+running 1 test
+test kv::tests::test_open_set ... ok
+
+successes:
+
+successes:
+    kv::tests::test_open_set
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+```
+
+此时产生的数据文件是这样的：
+```json
+// 1.log
+{"Set":{"key":"foo","value":"bar"}}{"Set":{"key":"foo1","value":"bar1"}}{"Set":{"key":"foo2","value":"bar2"}}
+```
+到这里，set方法大概齐了就。
+
+> 可是，这个open方法确实是写的太长了，也是属于一股脑儿往下写的那种，不过，其中有一部分想法是，能分步换行写就一步一步地往下写，你可能会发现，代码中代码中使用函数式编程的风格偶尔会有，但是相对有些比较复杂的地方就很少使用，个人觉得这样做是有一点好处的，就是可以清晰的看到每个步骤的返回类型，这样有助于理解标准库中的api，如果对api非常熟练，那就当我没说。后面想办法把它给抽抽，拆拆。
+
+### get方法
+
+
