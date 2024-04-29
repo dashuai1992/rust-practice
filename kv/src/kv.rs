@@ -115,12 +115,15 @@ impl KvStore {
 
             // 匹配到set命令
             Command::Set { key, .. } => {
+              // 将数据的位置范围记录在Btreemap中
               let cmd_index: CmdIdx = (file_name, Range {start: start_pos, end: end_pos}).into();
               let _ = &index.insert(key, cmd_index);
             },
 
             // 匹配到remove命令
-            Command::Remove { key } => todo!(),
+            Command::Remove { key } => {
+              index.remove(&key);
+            },
 
             // get命令不会在数据文件中
             _ => (),
@@ -128,6 +131,7 @@ impl KvStore {
           // 开始位置就是下个命令的结束位置
           start_pos = end_pos;
         }
+        // 每个文件的reader都保存下来，get的时候，根据key找到索引，索引中有文件名和key对应的位置。
         readers.insert(file_name, file_reader);
       }
 
@@ -164,19 +168,47 @@ impl KvStore {
     Ok(())
   }
 
-  pub fn get(&mut self, key: String) -> Result<String> {
+  pub fn get(&mut self, key: String) -> Result<Option<String>> {
+    // 根据key在索引中找到索引数据
     if let Some(cmd_idx) = self.index.get(&key) {
+      // 根据索引数据中的文件名找到对应数据文件的reader
       let reader = self.readers.get_mut(&cmd_idx.file).expect("没有找到数据文件！");
-      let seek = reader.seek(SeekFrom::Start(cmd_idx.pos))?;
+      // 移动reader读取数据文件的指针位置，索引中记录的数据的位置
+      let _ = reader.seek(SeekFrom::Start(cmd_idx.pos))?;
+      // 根据索引记录的数据长度，取出相应的数据
       let take = reader.take(cmd_idx.len);
+      // 使用serde_json读取数据转换成Command
       let from_reader = serde_json::from_reader::<_, Command>(take)?;
-      if let Command::Set { key, value } = from_reader {
-          Ok(value)
+      // 匹配command::set，能匹配到就返回value字段
+      if let Command::Set { value, .. } = from_reader {
+          Ok(Some(value))
       } else {
-        Err(Error::from(ErrorKind::UnexpectedEof))
+        // 匹配不到command::set
+        Ok(None)
       }
     } else {
-      Err(Error::from(ErrorKind::UnexpectedEof))
+      // 没有找到key对应的索引
+      Ok(None)
+    }
+  }
+
+  pub fn remove(&mut self, key: String) -> Result<()> {
+    // 判断索引中是否包含这个key
+    if self.index.contains_key(&key) {
+      // 写入文件
+      let cmd_rm = Command::Remove { key };
+      serde_json::to_writer(&mut self.writer, &cmd_rm)?;
+      self.writer.flush()?;
+      // 删除索引数据
+      if let Command::Remove { key } = cmd_rm {
+          self.index.remove(&key);
+      }
+
+      Ok(())
+    } else {
+
+      // 没有找到返回一个错误
+      Err(Error::from(ErrorKind::NotFound))
     }
   }
 }
@@ -212,6 +244,25 @@ use super::{command::Command, KvStore};
   }
 
   #[test]
+  fn test_get() -> Result<()> {
+    let mut open = KvStore::open()?;
+    let get = open.get("foo".to_string())?;
+    assert_eq!(Some("bar".to_string()), get);
+    Ok(())
+  }
+
+  #[test]
+  fn test_remove() -> Result<()> {
+    let mut open = KvStore::open()?;
+    let mut is_err = false;
+    open.remove("foo1".to_string()).unwrap_or_else(|_| is_err = true);
+    assert!(!is_err);
+    open.remove("foo10000".to_string()).unwrap_or_else(|_| is_err = true);
+    assert!(is_err);
+    Ok(())
+  }
+
+  #[test]
   fn test_json_reader() -> Result<()> {
     let join = current_dir()?.join("data.log");
     let file = File::open(join)?;
@@ -220,7 +271,7 @@ use super::{command::Command, KvStore};
     let mut stream_deserializer = from_reader.into_iter::<Command>();
 
     while let Some(cmd) = stream_deserializer.next() {
-      let byte_offset = stream_deserializer.byte_offset() as u64;
+      // let byte_offset = stream_deserializer.byte_offset() as u64;
       if let Command::Set { key, value } = cmd? {
           assert_eq!("key", key);
           assert_eq!("value", value);

@@ -26,7 +26,7 @@
 
 ## 那就开始吧
 
-万事开头难，那就边做边想吧。  
+万事开头难，那就边做边想吧。这只是个代码练习的项目，毕竟还只在学习rust没几天，当然是需要深度依赖github上其它的项目代码，多看多写，加油。
 
 ### 创建rust项目
 
@@ -492,7 +492,7 @@ impl<W: Write + Seek> Write for WriterWithPos<W> {
 }
 ```
 
-在写这些东西的时候，本人也毕竟还只在学习rust没几天，本职是做java开发的，得益于rust方便的测试环境，我可以在很多库不熟悉的情况下，写一些单元测试来验证它，同时，这对学习rust的标准库有很大的帮助，尽管写的测试代码并不是那么符合单元测试的规范。
+得益于rust方便的测试环境，我可以在很多库不熟悉的情况下，写一些单元测试来验证它，同时，这对学习rust的标准库有很大的帮助，尽管写的测试代码并不是那么符合单元测试的规范。
 
 ```rust
 #[cfg(test)]
@@ -549,4 +549,105 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; fini
 
 ### get方法
 
+开始写下set方法，该方法的大概逻辑就很简单了，方法参数就是key，拿着key去索引里找索引数据，索引数据的内容包含了数据所在的文件名，数据在文件中的位置等信息。  
+找到索引数据，根据数据所在的文件名找到文件对应的reader，有了reader，就可以根据索引记录的数据位置和长度取出对应的数据，再使用serde_json转换成对应的结构体，就可以拿到相应的数据了。写文字描述感觉还挺简单。  
 
+```rust
+  pub fn get(&mut self, key: String) -> Result<Option<String>> {
+    // 根据key在索引中找到索引数据
+    if let Some(cmd_idx) = self.index.get(&key) {
+      // 根据索引数据中的文件名找到对应数据文件的reader
+      let reader = self.readers.get_mut(&cmd_idx.file).expect("没有找到数据文件！");
+      // 移动reader读取数据文件的指针位置，索引中记录的数据的位置
+      let _ = reader.seek(SeekFrom::Start(cmd_idx.pos))?;
+      // 根据索引记录的数据长度，取出相应的数据
+      let take = reader.take(cmd_idx.len);
+      // 使用serde_json读取数据转换成Command
+      let from_reader = serde_json::from_reader::<_, Command>(take)?;
+      // 匹配command::set，能匹配到就返回value字段
+      if let Command::Set { value, .. } = from_reader {
+          Ok(Some(value))
+      } else {
+        // 匹配不到command::set
+        Ok(None)
+      }
+    } else {
+      // 没有找到key对应的索引
+      Ok(None)
+    }
+  }
+```
+
+顺带测试一下，测试结果告诉我貌似没问题：
+```rust
+  #[test]
+  fn test_get() -> Result<()> {
+    let mut open = KvStore::open()?;
+    let get = open.get("foo".to_string())?;
+    assert_eq!(Some("bar".to_string()), get);
+    Ok(())
+  }
+```
+
+那接下来就是remove方法了。
+
+### remove方法
+
+remove方法是本质是要根据key把对应的数据给删除，首先我们要删除的索引中的数据，然后将remove命令写入到数据文件，文件中不删除任何数据，这就需要KvStore在加载数据文件时回放数据，将所有的命令都执行一遍，就能保证数据的准确性。这感觉上是有问题的呀，算了，先这样写这个remove方法，后边想办法将数据文件中的指令合并。
+
+```rust
+  pub fn remove(&mut self, key: String) -> Result<()> {
+    // 判断索引中是否包含这个key
+    if self.index.contains_key(&key) {
+      // 写入文件
+      let cmd_rm = Command::Remove { key };
+      serde_json::to_writer(&mut self.writer, &cmd_rm)?;
+      self.writer.flush()?;
+      // 删除索引数据
+      if let Command::Remove { key } = cmd_rm {
+          self.index.remove(&key);
+      }
+
+      Ok(())
+    } else {
+
+      // 没有找到返回一个错误
+      Err(Error::from(ErrorKind::NotFound))
+    }
+  }
+```
+
+open方法的中加载文件数据加载到remove指令时，需要删除索引：
+```rust
+pub fn open() -> Result<KvStore> {
+    // ...省略...
+
+            // 匹配到set命令
+            Command::Set { key, .. } => {
+              // 将数据的位置范围记录在Btreemap中
+              let cmd_index: CmdIdx = (file_name, Range {start: start_pos, end: end_pos}).into();
+              let _ = &index.insert(key, cmd_index);
+            },
+
+            // 匹配到remove命令
+            Command::Remove { key } => {
+              index.remove(&key);
+            },
+
+    // ...省略...
+}
+```
+
+测试一下
+```rust
+ #[test]
+  fn test_remove() -> Result<()> {
+    let mut open = KvStore::open()?;
+    let mut is_err = false;
+    open.remove("foo1".to_string()).unwrap_or_else(|_| is_err = true);
+    assert!(!is_err);
+    open.remove("foo10000".to_string()).unwrap_or_else(|_| is_err = true);
+    assert!(is_err);
+    Ok(())
+  }
+```
