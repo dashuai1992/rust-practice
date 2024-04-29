@@ -1,3 +1,4 @@
 kv/target/
 kv/Cargo.lock
 kv/data/
+*.log

@@ -651,3 +651,231 @@ pub fn open() -> Result<KvStore> {
     Ok(())
   }
 ```
+
+### 指令数据合并
+
+在写remove方法的时候，发现，只是将指令写入文件，将索引数据删除，重新加载的时候，可能还需要回放好多无用已经删除的指令，所以，这里需要将指令给合并，也就是说set相同key时，数据只需要和最后一次一致即可，remove也是一样，remove指令之前相key的数据都应该是无效的数据。  
+那要怎么做呢？  
+这里期望是在KvStore的结构体中加入一个字段，用来标识当前可以合并的指令数据的长度，每次set时，判断索引中是否已经有过该key的数据了，如果有，就将这个字段累加上旧值的长度，remove时也是如此，最后，设置一个阈值，当这个字段的长度超过这个阈值时，将执行指令数据合并。
+
+定义阈值：
+```rust
+// 指令数据压缩阈值
+const COMPACTION_THRESHOLD: u64 = 1024;
+```
+
+给KvStore添加字段记录没有被压缩的指令数据长度：
+```rust
+struct KvStore {
+
+  ...
+
+  // 数据索引
+  index: BTreeMap<String, CmdIdx>,
+
+  // 未被压缩的指令数据长度
+  uncompacted: u64,
+}
+```
+
+在open方法里，修改回放索引数据的代码：
+```rust
+    ...
+
+          match cmd? {
+
+            // 匹配到set命令
+            Command::Set { key, .. } => {
+              // 将数据的位置范围记录在Btreemap中
+              let cmd_index: CmdIdx = (file_name, Range {start: start_pos, end: end_pos}).into();
+              if let Some(cmd_old) = &index.insert(key, cmd_index) {
+                // 将旧值长度累加
+                uncompacted += cmd_old.len;
+              }
+            },
+
+            // 匹配到remove命令
+            Command::Remove { key } => {
+              if let Some(cmd_old) = index.remove(&key) {
+                // 将旧值长度累加
+                uncompacted += cmd_old.len;  
+              }
+              // 刚才累加的set的长度，还需要把remove指令的长度也累加上
+              uncompacted += end_pos - start_pos;
+            },
+
+            // get命令不会在数据文件中
+            _ => (),
+          }
+
+    ...
+```
+
+每次set时累加uncompacted字段
+```rust
+...
+
+    // 将数据插入到内存索引中
+    if let Command::Set { key, .. } = cmd {
+      let insert = self.index.insert(key, (self.cur_data_file_name, (start..end)).into());
+
+      // 累加可以合并指令数据长度
+      if let Some(cmd_old) = insert {
+          self.uncompacted += cmd_old.len;
+      }
+
+      // 判断可合并的长度，大于阈值就执行合并方法
+      if COMPACTION_THRESHOLD < self.uncompacted {
+        todo!("执行合并指令数据的方法");
+      }
+    }
+
+...
+```
+
+每次remove时累加uncompacted字段
+```rust
+  pub fn remove(&mut self, key: String) -> Result<()> {
+    // 判断索引中是否包含这个key
+    if self.index.contains_key(&key) {
+      // 数据的开始位置 
+      let start = self.writer.pos;
+      // 写入文件
+      let cmd_rm = Command::Remove { key };
+      serde_json::to_writer(&mut self.writer, &cmd_rm)?;
+      self.writer.flush()?;
+      // 数据的结束位置
+      let end = self.writer.pos;
+      // 删除索引数据
+      if let Command::Remove { key } = cmd_rm {
+          let remove = self.index.remove(&key);
+          // 累加长度
+          if let Some(cmd_old) = remove {
+              self.uncompacted += cmd_old.len;
+          }
+          // remove指令的长度
+          self.uncompacted += end - start;
+      }
+
+      Ok(())
+    } else {
+
+      // 没有找到返回一个错误
+      Err(Error::from(ErrorKind::NotFound))
+    }
+  }
+```
+
+好了，uncompacted的累加已经处理完了，剩下的就是压缩合并的方法了，因为上面还有留着一个`todo!()`。
+
+### 压缩合并方法
+
+这里压缩数据文件时，以索引中的数据为准，将索引中对应的数据从文件中取出，写入新的数据文件中，修改索引数据中的数据位置，然后旧的数据文件就可以删除了。
+
+写一个测试方法，测试一下`io::copy()`的表现与期望的是否一致：
+```rust
+  #[test]
+  fn test_copy() -> Result<()> {
+    let mut buf_reader = BufReader::new(File::open(current_dir()?.join("data.log"))?);
+    let copy_file = OpenOptions::new().append(true).create(true).write(true).open(current_dir()?.join("data.copy.log"))?;
+    let mut copy_file_writer = WriterWithPos::new(copy_file)?;
+
+    let end_seek = buf_reader.seek(std::io::SeekFrom::End(0))?;
+    let _ = buf_reader.seek(std::io::SeekFrom::Start(0))?;
+
+    let mut take = buf_reader.take(end_seek);
+
+    let start = copy_file_writer.pos;
+    let copy_len = io::copy(take.get_mut(), copy_file_writer.by_ref())?;
+    let end = copy_file_writer.pos;
+
+    assert_eq!(copy_len, end-start);
+
+    Ok(())
+  }
+```
+
+给KvStore添加一个`compact()`的方法，开始编写这个方法，用来合并压缩数据文件：
+```rust
+  fn compact(&mut self) -> Result<()> {
+    // 压缩后要写入的文件
+    let compaction_file_name = self.cur_data_file_name + 1;
+    let compaction_file = OpenOptions::new().append(true).write(true).create(true).open(data_dir()?.join(format!("{}.log", compaction_file_name)))?;
+    let mut compaction_writer = WriterWithPos::new(compaction_file)?;
+    let compaction_reader = BufReader::new(File::open(data_dir()?.join(format!("{}.log", compaction_file_name)))?);
+    self.readers.insert(compaction_file_name, compaction_reader);
+
+    // 新来的数据写入的数据文件，区别于合并压缩过的数据文件
+    let cur_data_file_name = compaction_file_name + 1;
+    let cur_data_file = OpenOptions::new().append(true).write(true).create(true).open(data_dir()?.join(format!("{}.log", cur_data_file_name)))?;
+    self.writer = WriterWithPos::new(cur_data_file)?;
+    self.readers.insert(cur_data_file_name, BufReader::new(File::open(data_dir()?.join(format!("{}.log", cur_data_file_name)))?));
+    self.cur_data_file_name = cur_data_file_name;
+
+    // 遍历index
+    for cmd_idx in &mut self.index.values_mut() {
+
+      // 取出当前索引的reader
+      let reader = self.readers.get_mut(&cmd_idx.file).expect("没有找到数据文件！");
+
+      // 将索引对应的数据copy到压缩合并后的新数据文件中
+      reader.seek(SeekFrom::Start(cmd_idx.pos))?;
+      let mut take = reader.take(cmd_idx.len);
+      let start = compaction_writer.pos;
+      io::copy(take.by_ref(), compaction_writer.by_ref())?;
+      let end = compaction_writer.pos;
+
+      // 索引数据重新赋值，新文件的数据位置
+      *cmd_idx = (compaction_file_name, start..end).into();
+    }
+    // 至此，索引中的数据已经全部转移到了新的文件中，这个新文件就所说的指令数据压缩文件
+    compaction_writer.flush()?;
+    // 重置uncompacted
+    self.uncompacted = 0;
+
+    // 清除旧的数据文件 
+    let old_file_names = self.readers
+      .keys()
+      // 过滤出小于压缩合并文件的文件名，这已经是旧文件了。
+      .filter(|&&res| res < compaction_file_name)
+      .cloned()
+      .collect::<Vec<u32>>();
+
+    for file_name in old_file_names {
+      // 删除旧文件的reader
+      self.readers.remove(&file_name);
+      // 删除旧文件
+      fs::remove_file(data_dir()?.join(format!("{}.log",file_name)))?;
+    }
+
+    Ok(())
+  }
+```
+
+这个方法看起来相当窒息，和`KvStore::open()`一样，至少目前看起来是这样的，后面再重构它，没事。  
+添加一个测试方法来验证一下它是否有效：
+
+```rust
+  #[test]
+  fn test_compact() -> Result<()> {
+    let mut open = KvStore::open()?;
+    for i in 0..1000 {
+        open.set("key-foo".to_string(), format!("value-bar-{}", i))?;
+    }
+    // open.remove(format!("key-foo"))?;
+    open.compact()?;
+    assert_eq!("value-bar-999".to_string(), open.get("key-foo".to_string())?.expect("错误了。。"));
+
+    Ok(())
+  }
+```
+
+从测试结果来看，效果还是不错的，那就把它放在set方法里就行了  
+
+```rust
+      // 判断可合并的长度，大于阈值就执行合并方法
+      if COMPACTION_THRESHOLD < self.uncompacted {
+        self.compact()?;
+      }
+```
+

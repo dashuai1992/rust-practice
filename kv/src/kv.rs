@@ -1,11 +1,6 @@
 // kv.rs
 use std::{
-  collections::{BTreeMap, HashMap}, 
-  env::current_dir, 
-  ffi::OsStr, 
-  fs::{create_dir_all, read_dir, File, OpenOptions}, 
-  io::{BufReader, Error, ErrorKind, Read, Result, Seek, SeekFrom, Write},
-  ops::Range, path::PathBuf
+  collections::{BTreeMap, HashMap}, env::current_dir, ffi::OsStr, fs::{self, create_dir_all, read_dir, File, OpenOptions}, io::{self, BufReader, Error, ErrorKind, Read, Result, Seek, SeekFrom, Write}, ops::Range, path::PathBuf
 };
 
 use serde_json::Deserializer;
@@ -17,6 +12,9 @@ use self::{
 
 pub mod command;
 pub mod writer;
+
+// 指令数据压缩阈值
+const COMPACTION_THRESHOLD: u64 = 1024;
 
 /// KvStore, 存储键值对的上下文结构体
 struct KvStore {
@@ -35,7 +33,10 @@ struct KvStore {
   readers: HashMap<u32, BufReader<File>>,
 
   // 数据索引
-  index: BTreeMap<String, CmdIdx>
+  index: BTreeMap<String, CmdIdx>,
+
+  // 未被压缩的指令数据长度
+  uncompacted: u64,
 }
 
 impl KvStore {
@@ -97,6 +98,9 @@ impl KvStore {
       // 内存中的数据索引
       let mut index = BTreeMap::new();
 
+      // 未被压缩的指令数据长度
+      let mut uncompacted = 0;
+
       // 从所有的数据文件中加载数据到索引中
       for file_name in file_names {
         // 每个文件的reader
@@ -117,12 +121,20 @@ impl KvStore {
             Command::Set { key, .. } => {
               // 将数据的位置范围记录在Btreemap中
               let cmd_index: CmdIdx = (file_name, Range {start: start_pos, end: end_pos}).into();
-              let _ = &index.insert(key, cmd_index);
+              if let Some(cmd_old) = &index.insert(key, cmd_index) {
+                // 将旧值长度累加
+                uncompacted += cmd_old.len;
+              }
             },
 
             // 匹配到remove命令
             Command::Remove { key } => {
-              index.remove(&key);
+              if let Some(cmd_old) = index.remove(&key) {
+                // 将旧值长度累加
+                uncompacted += cmd_old.len;  
+              }
+              // 刚才累加的set的长度，还需要把remove指令的长度也累加上
+              uncompacted += end_pos - start_pos;
             },
 
             // get命令不会在数据文件中
@@ -142,6 +154,7 @@ impl KvStore {
         writer,
         readers,
         index,
+        uncompacted,
     })
   }
 
@@ -162,7 +175,17 @@ impl KvStore {
 
     // 将数据插入到内存索引中
     if let Command::Set { key, .. } = cmd {
-      self.index.insert(key, (self.cur_data_file_name, (start..end)).into());
+      let insert = self.index.insert(key, (self.cur_data_file_name, (start..end)).into());
+
+      // 累加可以合并指令数据长度
+      if let Some(cmd_old) = insert {
+          self.uncompacted += cmd_old.len;
+      }
+
+      // 判断可合并的长度，大于阈值就执行合并方法
+      if COMPACTION_THRESHOLD < self.uncompacted {
+        self.compact()?;
+      }
     }
     
     Ok(())
@@ -195,13 +218,23 @@ impl KvStore {
   pub fn remove(&mut self, key: String) -> Result<()> {
     // 判断索引中是否包含这个key
     if self.index.contains_key(&key) {
+      // 数据的开始位置 
+      let start = self.writer.pos;
       // 写入文件
       let cmd_rm = Command::Remove { key };
       serde_json::to_writer(&mut self.writer, &cmd_rm)?;
       self.writer.flush()?;
+      // 数据的结束位置
+      let end = self.writer.pos;
       // 删除索引数据
       if let Command::Remove { key } = cmd_rm {
-          self.index.remove(&key);
+          let remove = self.index.remove(&key);
+          // 累加长度
+          if let Some(cmd_old) = remove {
+              self.uncompacted += cmd_old.len;
+          }
+          // remove指令的长度
+          self.uncompacted += end - start;
       }
 
       Ok(())
@@ -211,6 +244,61 @@ impl KvStore {
       Err(Error::from(ErrorKind::NotFound))
     }
   }
+
+  fn compact(&mut self) -> Result<()> {
+    // 压缩后要写入的文件
+    let compaction_file_name = self.cur_data_file_name + 1;
+    let compaction_file = OpenOptions::new().append(true).write(true).create(true).open(data_dir()?.join(format!("{}.log", compaction_file_name)))?;
+    let mut compaction_writer = WriterWithPos::new(compaction_file)?;
+    let compaction_reader = BufReader::new(File::open(data_dir()?.join(format!("{}.log", compaction_file_name)))?);
+    self.readers.insert(compaction_file_name, compaction_reader);
+
+    // 新来的数据写入的数据文件，区别于合并压缩过的数据文件
+    let cur_data_file_name = compaction_file_name + 1;
+    let cur_data_file = OpenOptions::new().append(true).write(true).create(true).open(data_dir()?.join(format!("{}.log", cur_data_file_name)))?;
+    self.writer = WriterWithPos::new(cur_data_file)?;
+    self.readers.insert(cur_data_file_name, BufReader::new(File::open(data_dir()?.join(format!("{}.log", cur_data_file_name)))?));
+    self.cur_data_file_name = cur_data_file_name;
+
+    // 遍历index
+    for cmd_idx in &mut self.index.values_mut() {
+
+      // 取出当前索引的reader
+      let reader = self.readers.get_mut(&cmd_idx.file).expect("没有找到数据文件！");
+
+      // 将索引对应的数据copy到压缩合并后的新数据文件中
+      reader.seek(SeekFrom::Start(cmd_idx.pos))?;
+      let mut take = reader.take(cmd_idx.len);
+      let start = compaction_writer.pos;
+      io::copy(take.by_ref(), compaction_writer.by_ref())?;
+      let end = compaction_writer.pos;
+
+      // 索引数据重新赋值，新文件的数据位置
+      *cmd_idx = (compaction_file_name, start..end).into();
+    }
+    // 至此，索引中的数据已经全部转移到了新的文件中，这个新文件就所说的指令数据压缩文件
+    compaction_writer.flush()?;
+    // 重置uncompacted
+    self.uncompacted = 0;
+
+    // 清除旧的数据文件 
+    let old_file_names = self.readers
+      .keys()
+      // 过滤出小于压缩合并文件的文件名，这已经是旧文件了。
+      .filter(|&&res| res < compaction_file_name)
+      .cloned()
+      .collect::<Vec<u32>>();
+
+    for file_name in old_file_names {
+      // 删除旧文件的reader
+      self.readers.remove(&file_name);
+      // 删除旧文件
+      fs::remove_file(data_dir()?.join(format!("{}.log",file_name)))?;
+    }
+
+    Ok(())
+  }
+
 }
 
 fn data_dir() -> Result<PathBuf> {
@@ -219,10 +307,10 @@ fn data_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-  use std::{env::current_dir, fs::File, io::{BufReader, Result}};
+  use std::{env::current_dir, fs::{File, OpenOptions}, io::{self, BufReader, Read, Result, Seek, Write}};
 use serde_json::Deserializer;
 
-use super::{command::Command, KvStore};
+use super::{command::Command, writer::WriterWithPos, KvStore};
 
   #[test]
   fn test_set() -> Result<()> {
@@ -263,6 +351,19 @@ use super::{command::Command, KvStore};
   }
 
   #[test]
+  fn test_compact() -> Result<()> {
+    let mut open = KvStore::open()?;
+    for i in 0..1000 {
+        open.set("key-foo".to_string(), format!("value-bar-{}", i))?;
+    }
+    // open.remove(format!("key-foo"))?;
+    open.compact()?;
+    assert_eq!("value-bar-999".to_string(), open.get("key-foo".to_string())?.expect("错误了。。"));
+
+    Ok(())
+  }
+
+  #[test]
   fn test_json_reader() -> Result<()> {
     let join = current_dir()?.join("data.log");
     let file = File::open(join)?;
@@ -277,6 +378,26 @@ use super::{command::Command, KvStore};
           assert_eq!("value", value);
       }
     }
+
+    Ok(())
+  }
+
+  #[test]
+  fn test_copy() -> Result<()> {
+    let mut buf_reader = BufReader::new(File::open(current_dir()?.join("data.log"))?);
+    let copy_file = OpenOptions::new().append(true).create(true).write(true).open(current_dir()?.join("data.copy.log"))?;
+    let mut copy_file_writer = WriterWithPos::new(copy_file)?;
+
+    let end_seek = buf_reader.seek(std::io::SeekFrom::End(0))?;
+    let _ = buf_reader.seek(std::io::SeekFrom::Start(0))?;
+
+    let mut take = buf_reader.take(end_seek);
+
+    let start = copy_file_writer.pos;
+    let copy_len = io::copy(take.by_ref(), copy_file_writer.by_ref())?;
+    let end = copy_file_writer.pos;
+
+    assert_eq!(copy_len, end-start);
 
     Ok(())
   }
