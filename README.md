@@ -879,3 +879,355 @@ struct KvStore {
       }
 ```
 
+### 命令行处理
+
+把main方法修改一下，匹配每个命令时执行KvStore的方法：
+```rust
+fn main() {
+    let cli = Cli::parse();
+
+    let mut kv_store = KvStore::open().unwrap();
+
+   match cli.command {
+    Command::Set { key, value } => {
+        let _ = &kv_store.set(key, value).unwrap();
+    },
+    Command::Get { key } => {
+        let get = &kv_store.get(key).unwrap();
+        match get {
+            Some(value) => println!("{value}"),
+            None => println!("None"),
+        }
+    },
+    Command::Remove { key } => {
+        let _ = &kv_store.remove(key).unwrap();
+    },
+   }
+}
+```
+
+在控制台试下：
+
+```shell
+cargo run -- set foo bar
+cargo run -- get foo
+bar
+cargo run -- remove foo
+cargo run -- get foo
+None
+```
+
+### 打包
+
+```shell
+cargo build --release
+```
+
+执行一下打包过的二进制文件
+
+```shell
+./kv set foo bar
+```
+都已经到打包的步骤了，就算是已经完成了，并不是这样的，上面写的代码虽然可以正常的运行，但是还是存在一些待处理的问题，比如：代码结构太随意，其实还有很大的调整空间；每次执行命令就会生成一个日志文件。这些问题都是应该要被提上日程的。
+
+### 又双叒叕要重构了
+
+稍微给代码结构简单地拆一拆，现在`open`和`compact`这两方法太大一坨了。  
+这里并没有做太多操作，就是把大方法拆了拆，重复比较多的代码抽出来，最终是这样的：
+```rust
+// 指令数据压缩阈值
+const COMPACTION_THRESHOLD: u64 = 1024;
+
+/// KvStore, 存储键值对的上下文结构体
+pub struct KvStore {
+  // 数据文件的位置
+  data_path: PathBuf,
+  // 当前正在操作的数据文件
+  // 数据文件的命名方式使用数字递增的方式 1.log, 2.log, 3.log。。。
+  cur_data_file_name: u32,
+  // 当前数据文件的writer
+  writer: WriterWithPos<File>,
+  // 数据文件路径下所有文件reader
+  // 使用hashmap来存，key: 文件名, value: writer
+  readers: HashMap<u32, BufReader<File>>,
+  // 数据索引
+  index: BTreeMap<String, CmdIdx>,
+  // 未被压缩的指令数据长度
+  uncompacted: u64,
+}
+
+impl KvStore {
+  // 初始化KvStore
+  pub fn open() -> Result<KvStore> {
+    let data_path = data_dir()?;
+    // 从数据目录中读出文件名，并按数字大小排序，以便计算最新的数据文件名
+    let sorted_file_names = sorted_file_names(&data_path)?;
+    // 当前正在操作的数据文件名，从所有的文件中取出最大的，+1。
+    let cur_data_file_name = sorted_file_names.last().unwrap_or(&0) + 1;
+    // readers
+    let mut readers = HashMap::new();
+    // 内存中的数据索引
+    let mut index = BTreeMap::new();
+    // 未被压缩的指令数据长度
+    let mut uncompacted = 0;
+    uncompacted += load_idx(&data_path, sorted_file_names, &mut readers, &mut index)?;
+    // writer, 顺带把reader也给创建放入readers中
+    let writer = new_data_file(&data_path, cur_data_file_name, &mut readers)?;
+    // 返回
+    Ok(KvStore {
+        data_path,
+        cur_data_file_name,
+        writer,
+        readers,
+        index,
+        uncompacted,
+    })
+  }
+
+  /// set
+  pub fn set(&mut self, key: String, value: String) -> Result<()> {
+    // set命令对象
+    let cmd = Command::Set { key, value };
+    // 数据开始位置
+    let start = self.writer.pos;
+    // 写入json到文件
+    serde_json::to_writer(self.writer.by_ref(), &cmd)?;
+    self.writer.flush()?;
+    // 数据结束位置
+    let end = self.writer.pos;
+    // 将数据插入到内存索引中
+    if let Command::Set { key, .. } = cmd {
+      let insert = self.index.insert(key, (self.cur_data_file_name, (start..end)).into());
+      // 累加可以合并指令数据长度
+      if let Some(cmd_old) = insert {
+          self.uncompacted += cmd_old.len;
+      }
+      // 判断可合并的长度，大于阈值就执行合并方法
+      if COMPACTION_THRESHOLD < self.uncompacted {
+        self.compact()?;
+      }
+    }
+    
+    Ok(())
+  }
+
+  pub fn get(&mut self, key: String) -> Result<Option<String>> {
+    // 根据key在索引中找到索引数据
+    if let Some(cmd_idx) = self.index.get(&key) {
+      // 根据索引数据中的文件名找到对应数据文件的reader
+      let reader = self.readers.get_mut(&cmd_idx.file).expect("没有找到数据文件！");
+      // 移动reader读取数据文件的指针位置，索引中记录的数据的位置
+      let _ = reader.seek(SeekFrom::Start(cmd_idx.pos))?;
+      // 根据索引记录的数据长度，取出相应的数据
+      let take = reader.take(cmd_idx.len);
+      // 使用serde_json读取数据转换成Command
+      let from_reader = serde_json::from_reader::<_, Command>(take)?;
+      // 匹配command::set，能匹配到就返回value字段
+      if let Command::Set { value, .. } = from_reader {
+          Ok(Some(value))
+      } else {
+        // 匹配不到command::set
+        Ok(None)
+      }
+    } else {
+      // 没有找到key对应的索引
+      Ok(None)
+    }
+  }
+
+  pub fn remove(&mut self, key: String) -> Result<()> {
+    // 判断索引中是否包含这个key
+    if self.index.contains_key(&key) {
+      // 数据的开始位置 
+      let start = self.writer.pos;
+      // 写入文件
+      let cmd_rm = Command::Remove { key };
+      serde_json::to_writer(&mut self.writer, &cmd_rm)?;
+      self.writer.flush()?;
+      // 数据的结束位置
+      let end = self.writer.pos;
+      // 删除索引数据
+      if let Command::Remove { key } = cmd_rm {
+          let remove = self.index.remove(&key);
+          // 累加长度
+          if let Some(cmd_old) = remove {
+              self.uncompacted += cmd_old.len;
+          }
+          // remove指令的长度
+          self.uncompacted += end - start;
+      }
+      Ok(())
+    } else {
+
+      // 没有找到返回一个错误
+      Err(Error::from(ErrorKind::NotFound))
+    }
+  }
+
+  fn compact(&mut self) -> Result<()> {
+    // 压缩后要写入的文件
+    let compaction_file_name = self.cur_data_file_name + 1;
+    let mut compaction_writer = new_data_file(&self.data_path, compaction_file_name, &mut self.readers)?;
+    // 新来的数据写入的数据文件，区别于合并压缩过的数据文件
+    let cur_data_file_name = compaction_file_name + 1;
+    self.writer = new_data_file(&self.data_path, cur_data_file_name, &mut self.readers)?;
+    // 重新设置当前的数据文件
+    self.cur_data_file_name = cur_data_file_name;
+    // 遍历index
+    for cmd_idx in &mut self.index.values_mut() {
+      // 取出当前索引的reader
+      let reader = self.readers.get_mut(&cmd_idx.file).expect("没有找到数据文件！");
+      // 将索引对应的数据copy到压缩合并后的新数据文件中
+      reader.seek(SeekFrom::Start(cmd_idx.pos))?;
+      let mut take = reader.take(cmd_idx.len);
+      let start = compaction_writer.pos;
+      io::copy(take.by_ref(), compaction_writer.by_ref())?;
+      let end = compaction_writer.pos;
+      // 索引数据重新赋值，新文件的数据位置
+      *cmd_idx = (compaction_file_name, start..end).into();
+    }
+    // 至此，索引中的数据已经全部转移到了新的文件中，这个新文件就所说的指令数据压缩文件
+    compaction_writer.flush()?;
+    // 重置uncompacted
+    self.uncompacted = 0;
+    // 清除旧的数据文件 
+    let old_file_names = self.readers
+      .keys()
+      // 过滤出小于压缩合并文件的文件名，这已经是旧文件了。
+      .filter(|&&res| res < compaction_file_name)
+      .cloned()
+      .collect::<Vec<u32>>();
+    for file_name in old_file_names {
+      // 删除旧文件的reader
+      self.readers.remove(&file_name);
+      // 删除旧文件
+      fs::remove_file(data_dir()?.join(format!("{}.log",file_name)))?;
+    }
+
+    Ok(())
+  }
+
+}
+
+fn data_dir() -> Result<PathBuf> {
+  // 数据文件路径
+  // current_dir/data
+  let data_path = current_dir()?.join("data");
+  // 创建目录
+  create_dir_all(&data_path)?;
+  Ok(data_path)
+}
+
+fn sorted_file_names(data_path: &PathBuf) -> Result<Vec<u32>> {
+  // 读取数据文件目录所有的文件，
+  // 过滤，只要.log结尾的文件
+  // 只要数字开头的文件
+  let mut file_names: Vec<u32> = read_dir(data_path)?
+    // 展开PathBuf
+    .flat_map(|res| Ok(res?.path()) as Result<PathBuf>)
+    // 过滤出.log文件 
+    .filter(|res| res.is_file() && res.extension() == Some("log".as_ref()))
+    // 从路径中取出文件名
+    .flat_map(|res| {
+      res
+        // 文件名
+        .file_name()
+        // 转系统字符
+        .and_then(OsStr::to_str)
+        // 去掉后缀
+        .map(|res| res.trim_end_matches(".log"))
+        // 转u32
+        .map(str::parse::<u32>)
+    })
+    // 展开
+    .flatten()
+    .collect();
+
+    // 文件名数字排序
+    file_names.sort();
+
+    Ok(file_names)
+}
+
+fn data_file_path(path: &PathBuf, file_name: u32) -> Result<PathBuf> {
+  Ok(path.join(format!("{}.log", file_name)))
+}
+
+fn new_data_file(dir: &PathBuf, file_name: u32, readers: &mut HashMap<u32, BufReader<File>>) -> Result<WriterWithPos<File>> {
+
+  // 文件路径
+  let file_path = data_file_path(dir, file_name)?;
+
+  // writer, 文件已经创建
+  let writer = WriterWithPos::new(
+    OpenOptions::new()
+    .create(true)
+    .read(true)
+    .write(true)
+    .append(true)
+    .open(&file_path)?
+  )?;
+  readers.insert(file_name, BufReader::new(File::open(file_path)?));
+
+  Ok(writer)
+}
+
+fn load_idx(dir: &PathBuf, 
+  file_names: Vec<u32>, 
+  readers: &mut HashMap<u32, BufReader<File>>, 
+  index: &mut BTreeMap<String, CmdIdx>) -> Result<u64> {
+    let mut uncompacted = 0;
+    // 从所有的数据文件中加载数据到索引中
+    for file_name in file_names {
+      // 每个文件的reader
+      let file = File::open(data_file_path(dir, file_name)?)?;
+      let mut file_reader = BufReader::new(file);
+      uncompacted += load_idx_from_file(file_name, &mut file_reader, index)?;
+      
+      // 每个文件的reader都保存下来，get的时候，根据key找到索引，索引中有文件名和key对应的位置。
+      readers.insert(file_name, file_reader);
+    }
+  Ok(uncompacted)
+}
+
+fn load_idx_from_file(file_name: u32, 
+  file_reader: &mut BufReader<File>, 
+  index: &mut BTreeMap<String, CmdIdx>) -> Result<u64> {
+  let mut uncompacted = 0;
+  // 从文件开始位置读
+  let mut start_pos = file_reader.seek(SeekFrom::Start(0))?;
+  // 按Command的json格式读
+  let mut from_reader = Deserializer::from_reader(file_reader).into_iter::<Command>();
+  while let Some(cmd) = from_reader.next() {
+    // command的结束位置
+    let end_pos = from_reader.byte_offset() as u64;
+    match cmd? {
+      // 匹配到set命令
+      Command::Set { key, .. } => {
+        // 将数据的位置范围记录在Btreemap中
+        let cmd_index: CmdIdx = (file_name, Range {start: start_pos, end: end_pos}).into();
+        if let Some(cmd_old) = index.insert(key, cmd_index) {
+          // 将旧值长度累加
+          uncompacted += cmd_old.len;
+        }
+      },
+      // 匹配到remove命令
+      Command::Remove { key } => {
+        if let Some(cmd_old) = index.remove(&key) {
+          // 将旧值长度累加
+          uncompacted += cmd_old.len;  
+        }
+        // 刚才累加的set的长度，还需要把remove指令的长度也累加上
+        uncompacted += end_pos - start_pos;
+      },
+      // get命令不会在数据文件中
+      _ => (),
+    }
+    // 开始位置就是下个命令的结束位置
+    start_pos = end_pos;
+  }
+  Ok(uncompacted)
+}
+```
+### 记作v1
+到这里，就算是第一阶段完成了，这个过程中有很大的收获，这个项目里的代码到目前为止，可以学习到大量的io操作，json序列化到文件，读取，也算是很不错的代码练习项目了。
