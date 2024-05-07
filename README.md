@@ -1231,3 +1231,321 @@ fn load_idx_from_file(file_name: u32,
 ```
 ### 记作v1
 到这里，就算是第一阶段完成了，这个过程中有很大的收获，这个项目里的代码到目前为止，可以学习到大量的io操作，json序列化到文件，读取，也算是很不错的代码练习项目了。
+
+## 网络客户端
+这个章节记作v2，在这个章节中，将会给这个应用加入网络连接的功能，使用客户端可以连接到服务端，使用网络请求完成对数据的操作。  
+
+### 加入服务端
+添加一个mod，名叫server，它包含了KvStore的实例对象，并且有一个start方法，可以启动服务。
+```rust
+use std::{io::Result, net::{TcpListener, TcpStream}};
+
+use crate::kv::KvStore;
+
+const SERVER_PORT: &str = "127.0.0.1:4000";
+
+pub struct KvServer {
+  store: KvStore,
+}
+
+impl KvServer {
+  pub fn new(&mut self) -> Result<KvServer> {
+      Ok(KvServer { store: KvStore::open()? })
+  }
+
+  pub fn start(&mut self) -> Result<()> {
+    let tcp_listener = TcpListener::bind(SERVER_PORT)?;
+    for stream in tcp_listener.incoming() {
+      match stream {
+        Ok(stream) => {
+          if let Err(e) = self.handle_connection(stream) {
+            println!("请求错误！{}", e);
+          }
+        },
+        Err(e) => println!("网络连接错误！{}", e),
+      }
+    }
+    Ok(())
+  }
+
+  fn handle_connection(&mut self, stream: TcpStream) -> Result<()> {
+    todo!();
+    Ok(())
+  }
+}
+```
+参考标准库，现在已经完成了服务端的网络监听，接下来要做的就是将请求来的数据转换成命令，然后再调用KvStore，就行了。那就需要继续在handle_connection这个方法中完成该需求。  
+
+在开始处理handle_connection的工作前，需要定义一下统一的请求和响应，这样在服务端和客户端都可以使用一致的处理方式。  
+```rust
+// req.rs
+use serde::{Deserialize, Serialize};
+
+use crate::kv::command::Command;
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Request {
+  command: Command,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Response {
+  result: Result<Option<String>, String>
+}
+```
+
+处理请求，handle_connection  
+```rust
+  fn handle_connection(&mut self, stream: TcpStream) -> Result<()> {
+    let peer_addr = stream.peer_addr()?;
+    println!("from: {}", peer_addr);
+
+    let reader = Deserializer::from_reader(BufReader::new(&stream));
+    let mut writer = BufWriter::new(&stream);
+
+    for reqeust in reader.into_iter::<Request>().flatten() {
+      println!("command: {}", serde_json::to_string(&reqeust.command)?);
+      match reqeust.command {
+        Command::Set { key, value } => {
+          let set = self.store
+            .set(key, value)
+            .map(|_|Some("ok".to_string()))
+            .map_err(|e| format!("{e}"));
+
+          serde_json::to_writer(&mut writer, &Response{result: set})?;
+          writer.flush()?;
+        },
+        Command::Get { key } => {
+
+        },
+        Command::Remove { key } => {
+
+        },
+      }
+    }
+    Ok(())
+  }
+```
+先实现一个set方法，然后再写个测试方法，测试一下：
+```rust
+  #[test]
+  fn test_tcp_set() -> io::Result<()> {
+    let tcp_stream = TcpStream::connect("127.0.0.1:4000")?;
+
+    let mut writer = BufWriter::new(&tcp_stream);
+    let value = Command::Set { key: "key".to_string(), value: "value".to_string() };
+
+    serde_json::to_writer(&mut writer, &Request{command: value})?;
+    writer.flush()?;
+
+    let buf_reader = BufReader::new(&tcp_stream);
+    let mut reader = Deserializer::from_reader(buf_reader);
+    let resp = Response::deserialize(&mut reader)?;
+
+    assert_eq!(resp.result, Ok(Some("ok".to_string())));
+
+    Ok(())
+  }
+```
+测试了一下，通过了。接下来就是照葫芦画瓢，把get和remove完善一下。
+
+```rust
+  fn handle_connection(&mut self, stream: TcpStream) -> Result<()> {
+    let peer_addr = stream.peer_addr()?;
+    println!("from: {}", peer_addr);
+
+    let reader = Deserializer::from_reader(BufReader::new(&stream));
+    let mut writer = BufWriter::new(&stream);
+
+    for reqeust in reader.into_iter::<Request>().flatten() {
+      println!("command: {}", serde_json::to_string(&reqeust.command)?);
+      match reqeust.command {
+        Command::Set { key, value } => {
+          let set = self.store
+            .set(key, value)
+            .map(|_|Some("ok".to_string()))
+            .map_err(|e| format!("{e}"));
+
+          serde_json::to_writer(&mut writer, &Response{result: set})?;
+          writer.flush()?;
+        },
+        Command::Get { key } => {
+          let get = self.store
+            .get(key)
+            .map_err(|e| format!("{e}"));
+
+          serde_json::to_writer(&mut writer, &Response{result: get})?;
+          writer.flush()?; 
+        },
+        Command::Remove { key } => {
+          let remove = self.store
+            .remove(key)
+            .map(|_|Some("ok".to_string()))
+            .map_err(|e| format!("{e}"));
+
+          serde_json::to_writer(&mut writer, &Response{result: remove})?;
+          writer.flush()?;
+        },
+      }
+    }
+    Ok(())
+  }
+```
+还是和之前一样，需要编写一个测试方法，它可以使我们心里更加的放松。
+```rust
+#[test]
+  fn test_tcp_set() -> io::Result<()> {
+    let tcp_stream = TcpStream::connect("127.0.0.1:4000")?;
+    let mut writer = BufWriter::new(&tcp_stream);
+    let mut reader = Deserializer::from_reader(BufReader::new(&tcp_stream));
+
+    // set
+    let value = Command::Set { key: "key".to_string(), value: "value".to_string() };
+    serde_json::to_writer(&mut writer, &Request{command: value})?;
+    writer.flush()?;
+    let resp = Response::deserialize(&mut reader)?;
+    assert_eq!(resp.result, Ok(Some("ok".to_string())));
+
+    // get
+    let value = Command::Get { key: "key".to_string() };
+    serde_json::to_writer(&mut writer, &Request{command: value})?;
+    writer.flush()?;
+    let resp = Response::deserialize(&mut reader)?;
+    assert_eq!(resp.result, Ok(Some("value".to_string())));
+
+    // remove
+    let value = Command::Remove { key: "key".to_string() };
+    serde_json::to_writer(&mut writer, &Request{command: value})?;
+    writer.flush()?;
+    let resp = Response::deserialize(&mut reader)?;
+    assert_eq!(resp.result, Ok(Some("ok".to_string())));
+
+    Ok(())
+  }
+```
+
+测试结果当然是令人满意的，至此，server已经开发完了，那么，接下来就是client了。
+
+### 编写client
+
+因为之前已经写了测试方法了，所以，编写的client的时候，就参考测试方法就行了。
+```rust
+// client.rs
+use std::{io::{BufReader, BufWriter, Result, Write}, net::TcpStream};
+
+use clap::Parser;
+use kv::{kv::command::{Cli, Command}, req::{Request, Response}};
+use serde::Deserialize;
+use serde_json::{de::IoRead, Deserializer};
+
+const DEFAULT_SERVER_PORT: &str = "127.0.0.1:4000";
+
+struct Connection {
+  stream_writer: BufWriter<TcpStream>,
+  stream_reader: Deserializer<IoRead<BufReader<TcpStream>>>,
+}
+
+impl Connection {
+  fn open(port: String) -> Result<Connection> {
+    let connect = TcpStream::connect(port)?;
+    let stream_writer = BufWriter::new(connect.try_clone()?);
+    let stream_reader = Deserializer::from_reader(BufReader::new(connect));
+
+    Ok(Connection {
+      stream_writer,
+      stream_reader 
+    })
+  }
+
+  fn get(&mut self, key: String) -> Result<Response> {
+    let command = Command::Get { key };
+    serde_json::to_writer(&mut self.stream_writer, &Request{ command })?;
+    self.stream_writer.flush()?;
+
+    let resp = Response::deserialize(&mut self.stream_reader)?;
+    Ok(resp)
+  }
+
+  fn set(&mut self, key: String, value: String) -> Result<Response> {
+    let command = Command::Set { key, value };
+    serde_json::to_writer(&mut self.stream_writer, &Request{ command })?;
+    self.stream_writer.flush()?;
+
+    let resp = Response::deserialize(&mut self.stream_reader)?;
+    Ok(resp)
+  }
+
+  fn remove(&mut self, key: String) -> Result<Response> {
+    let command = Command::Remove { key };
+    serde_json::to_writer(&mut self.stream_writer, &Request{ command })?;
+    self.stream_writer.flush()?;
+
+    let resp = Response::deserialize(&mut self.stream_reader)?;
+    Ok(resp)
+  }
+}
+
+fn main() {
+  let parse = Cli::parse();
+
+  let port = parse
+    .port
+    .or(Some(String::from(DEFAULT_SERVER_PORT)));
+
+  let mut connect = Connection::open(port.unwrap())
+    .expect("连接服务器异常！");
+
+  match parse.command {
+    Command::Set { key, value } => {
+      let set = connect.set(key, value).unwrap();
+      println!("{:?}", set);
+    },
+    Command::Get { key } => {
+      let get = connect.get(key).unwrap();
+      println!("{:?}", get);
+    },
+    Command::Remove { key } => {
+      let remove = connect.remove(key).unwrap();
+      println!("{:?}", remove); 
+    },
+  }
+}
+```
+写过和server和测试方法后，这个client写起来就感觉没那么难了。好了，把两个端都跑起来吧。看下效果。  
+启动服务端  
+```shell
+cargo run --bin server 
+```
+
+客户端
+```shell
+cargo run --bin client -- --help
+
+Usage: client [OPTIONS] <COMMAND>
+
+Commands:
+  set     
+  get     
+  remove  
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -p, --port <IP:PORT>  
+  -h, --help            Print help
+  -V, --version         Print version
+```
+
+客户端命令
+```shell
+cargo run --bin client -- set key value
+Response { result: Ok(Some("ok")) }
+
+cargo run --bin client -- get key
+Response { result: Ok(Some("value")) }
+
+cargo run --bin client -- remove key
+Response { result: Ok(Some("ok")) }
+
+cargo run --bin client -- get key
+Response { result: Ok(None) }
+```
