@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 pub struct Cli {
+  #[arg(short, long, value_name = "IP:PORT")]
+  pub port: Option<String>,
+
   #[command(subcommand)]
   pub command: Command,
 }
