@@ -1549,3 +1549,80 @@ Response { result: Ok(Some("ok")) }
 cargo run --bin client -- get key
 Response { result: Ok(None) }
 ```
+
+## server端多线程
+
+现在的server端的处理命令的方式是单线程的处理方式。现在我们尝试将其改造成多线程的处理方式。  
+
+首先，需要写一个线程池，这个线程池rust官网教程是有一个章节介绍过的，多线程web应用的那个章节。我们可以参考它的多线程和线程池的实现方式。  
+
+```rust
+use std::{io::Result, sync::{mpsc::{channel, Receiver, Sender}, Arc, Mutex}, thread::{self, JoinHandle}, usize};
+
+struct Worker {
+  id: usize,
+  thread: Option<JoinHandle<()>>,
+}
+
+impl Worker {
+  fn new(id: usize, receiver: Arc<Mutex<Receiver<Job>>>) -> Worker {
+    let thread = thread::spawn(move || loop {
+      match receiver.lock().unwrap().recv() {
+        Ok(job) => {
+          println!("woker {id} 接收到一个任务，开始执行。");
+          job();
+        },
+        Err(_) => println!("worker {id} 断开了连接，正在关闭。"),
+      }
+    });
+    Worker { id, thread: Some(thread), }
+  }
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+pub struct ThreadPool {
+  workers: Vec<Worker>,
+  sender: Option<Sender<Job>>,
+}
+
+impl ThreadPool {
+  pub fn new(size: usize) -> Result<ThreadPool> {
+    assert!(size > 0);
+    println!("开始创建线程池，线程数量：{size}");
+
+    let (sender, receiver) = channel::<Job>();
+    let receiver = Arc::new(Mutex::new(receiver));
+
+    let mut workers = Vec::with_capacity(size);
+    for i in 0..size {
+      let worker = Worker::new(i, Arc::clone(&receiver));
+      workers.push(worker);
+      println!("第 {i} 个线程已创建, 线程id: {i}");
+    }
+
+    println!("线程池创建完毕");
+    Ok(ThreadPool {workers, sender: Some(sender)})
+  }
+
+  pub fn execute<F>(&self, f: F)
+  where 
+    F: FnOnce() + Send + 'static, 
+  {
+    println!("线程池推入任务。");
+    self.sender.as_ref().unwrap().send(Box::new(f)).unwrap();
+  }
+}
+
+impl Drop for ThreadPool {
+  fn drop(&mut self) {
+    drop(self.sender.take());
+    for worker in &mut self.workers {
+      println!("Shutting down worker {}", worker.id);
+      if let Some(thread) = worker.thread.take() {
+        thread.join().unwrap();
+      }
+    }
+  }
+}
+```
