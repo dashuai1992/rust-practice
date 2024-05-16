@@ -12,6 +12,7 @@ use self::{
 
 pub mod command;
 pub mod writer;
+pub mod asyn_store;
 
 // 指令数据压缩阈值
 const COMPACTION_THRESHOLD: u64 = 1024;
@@ -69,7 +70,8 @@ impl KvStore {
     // 数据开始位置
     let start = self.writer.pos;
     // 写入json到文件
-    serde_json::to_writer(self.writer.by_ref(), &cmd)?;
+    let writer = self.writer.by_ref();
+    serde_json::to_writer(writer, &cmd)?;
     self.writer.flush()?;
     // 数据结束位置
     let end = self.writer.pos;
