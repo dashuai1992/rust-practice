@@ -1626,3 +1626,260 @@ impl Drop for ThreadPool {
   }
 }
 ```
+这个线程池应该是不用多说了，官网教程上一样一样的。
+
+我们新建一个支持多线程的store,名字就叫`AsynKvStore`，它的属性是这样的：
+```rust
+pub struct AsynKvStore {
+  writer: Arc<Mutex<StoreWriter>>,
+  reader: StoreReader,
+  index: Arc<Mutex<BTreeMap<String, CmdIdx>>>
+}
+```
+这里和之前的单线程的不太一样，这里目的是期望使用`reader`和`writer`来将读操作和写操作独立开。get方法属于读操作，就把它的逻辑写的reader中，set和remove方法是写操作，就把它们两个写在writer，因为是多线程操作，writer是要加锁的，这样的话就不太会影响到reader的操作。  
+并且这里也很多属性都使用到了`Arc`这个东西，它是原子引用记数，方便的多线程的场景中对数据进行引用。  
+
+StoreReader中放入每个文件的reader，使用到了RefCell来标记readers所在的HashMap，这个RefCell是一个可以内部存储的容器，我是这样理解的，数据对象整体不变，但是内部局部可变，和Cell有着一样的定义，但是两个又有区别，Cell适用于可Copy的小数据结构，RefCell则是适用于非Copy的大对象数据结构，并且提供引用。  
+
+`safe_point`这个字段，可以看到这里定义了一个全局的引用类型，它主要的作用就是用来记录数据文件压缩完成后写入的压缩文件，然后清除文件时，这个节点前的文件就都可以清除，hashMap中的保存的BufReader也可以根据这个字段来清除，小于`safe_point`的reader全部清除掉。
+
+```rust
+struct StoreReader {
+  readers: RefCell<HashMap<u32, BufReader<File>>>,
+  data_path: Arc<PathBuf>,
+  safe_point: Arc<AtomicU32>
+}
+```
+
+清除reader的操作：
+```rust
+  fn close_stale_handles(&self) {
+    let mut readers = self.readers.borrow_mut();
+
+    if !readers.is_empty() {
+      let stales = readers
+        .keys()
+        .filter(|&&res| res < self.safe_point.load(Ordering::SeqCst))
+        .cloned()
+        .collect::<Vec<u32>>();
+
+      for stale in stales {
+        readers.remove(&stale);
+      }
+    }
+  }
+```
+
+reader负责`get`，writer负责`set`和`remove`：
+
+```rust
+  pub fn set(&self, key: String, value: String) -> Result<()> {
+    self.writer.lock().unwrap().set(key, value)
+  }
+
+  pub fn get(&self, key: String) -> Result<Option<String>> {
+    if let Some(cmd_idx) = self.index.lock().unwrap().get(&key) {
+      self.reader.borrow().get(cmd_idx)
+    } else {
+      Ok(None)
+    }
+  }
+
+  pub fn remove(&self, key: String) -> Result<()> {
+    self.writer.lock().unwrap().remove(key)
+  }
+```
+
+
+在写这个的时候，被rust的借用检查快给整疯了，好在静下心来写了好多demo，自己验证了很多rust语言的借用方式，最终才坚持写下来的。  
+
+HashMap没有实现Clone，所以这里的StoreReader实现了Clone，其它地方的引用StoreReader的时候，可以通过这个clone方法，将其中的readers单独构建出来一份，这样的好处在于，各个线程或其它地方的readers中的BufReader不是共享的，之前不存在引用关系，所以文件读取的时候，或许会有到seek的操作，这样就不会相互影响，至少我是这样理解的，我也没有试多个线程使用引用的时候，seek会不会相互，我想应该会影响吧，哈哈。  
+
+```rust
+impl Clone for StoreReader {
+  fn clone(&self) -> Self {
+    Self { 
+      readers: RefCell::new(HashMap::new()),
+      data_path: Arc::clone(&self.data_path),
+      safe_point: Arc::clone(&self.safe_point),
+    }
+  }
+}
+```
+
+然后就是正常的写AsynStore的`open`方法，这样，这样，然后再这样就好了：
+```rust
+  pub fn open() -> Result<Self> {
+    let data_path = data_dir()?;
+    fs::create_dir_all(&data_path)?;
+
+    let mut index: BTreeMap<String, CmdIdx> = BTreeMap::new();
+    let mut readers: HashMap<u32, BufReader<File>> = HashMap::new();
+    let mut uncompacted = 0u64;
+
+    let file_names = sorted_file_names(&data_path)?;
+    let cur_data_file_name = file_names.last().unwrap_or(&0)+1;
+    let data_files = file_names.clone();
+    uncompacted += load_idx(&data_path, file_names, &mut readers, &mut index)?;
+
+    let index = Arc::new(Mutex::new(index));
+    let writer = StoreWriter {
+      cur_data_file_name,
+      uncompacted,
+      index: index.clone(),
+      writer: new_data_file(&data_path, cur_data_file_name, &mut readers)?,
+    }; 
+
+    let data_path = Arc::new(data_path);
+    let reader = StoreReader {
+      readers: RefCell::new(readers),
+      data_files: Arc::new(data_files),
+      data_path: Arc::clone(&data_path),
+    };
+
+    let store = AsynKvStore {
+      writer: Arc::new(Mutex::new(writer)),
+      reader,
+      index,
+    };
+    Ok(store)
+  }
+
+```
+
+get方法还是和原来的大差不差：
+```rust
+impl StoreReader {
+  fn get(&self, cmd_idx: &CmdIdx) -> Result<Option<String>> {
+    self.read_and(cmd_idx, |take| {
+      let command = serde_json::from_reader::<Take<&mut BufReader<File>>, Command>(take)?;
+      if let Command::Set { value, .. } = command {
+        Ok(Some(value))
+      } else {
+        Ok(None)
+      }
+    })
+  }
+
+  fn read_and<F, R>(&self, cmd_idx: &CmdIdx, f: F) -> Result<R>
+  where
+    F: FnOnce(Take<&mut BufReader<File>>) -> Result<R>
+  {
+    self.close_stale_handles();
+
+    let mut readers = (&self.readers).borrow_mut();
+    if !readers.contains_key(&cmd_idx.file) {
+      readers.insert(
+        cmd_idx.file, 
+        BufReader::new(File::open(data_file_path(&self.data_path, cmd_idx.file)?)?)
+      );
+    }
+    let reader = readers.get_mut(&cmd_idx.file).unwrap();
+    reader.seek(SeekFrom::Start(cmd_idx.pos))?;
+    f(reader.take(cmd_idx.len))
+  }
+}
+```
+
+接下来就是把`set`和`remove`方法补充一下：
+```rust
+struct StoreWriter {
+  uncompacted: u64,
+  writer: WriterWithPos<File>,
+  index: Arc<Mutex<BTreeMap<String, CmdIdx>>>,
+  cur_data_file_name: u32,
+  data_path: Arc<PathBuf>,
+  reader: StoreReader,
+}
+
+impl StoreWriter {
+  fn set(&mut self, key: String, value: String) -> Result<()> {
+    let cmd = Command::Set { key, value };
+    
+    let start = self.writer.pos;
+    serde_json::to_writer(&mut self.writer, &cmd)?;
+    self.writer.flush()?;
+    let end = self.writer.pos;
+
+    if let Command::Set { key, .. } = cmd {
+      let insert = self.index.lock().unwrap().insert(key, (self.cur_data_file_name, (start..end)).into());
+      if let Some(cmd_old) = insert {
+          self.uncompacted += cmd_old.len;
+      }
+      if COMPACTION_THRESHOLD < self.uncompacted {
+        self.compact()?;
+      }
+    }
+
+    Ok(())
+  }
+
+  fn remove(&mut self, key: String) -> Result<()> {
+    if self.index.lock().unwrap().contains_key(&key) {
+      let idx_key = key.clone();
+      let cmd = Command::Remove { key };
+    
+      let start = self.writer.pos;
+      serde_json::to_writer(&mut self.writer, &cmd)?;
+      self.writer.flush()?;
+      let end = self.writer.pos; 
+
+      if let Some(cmd_idx) = self.index.lock().unwrap().remove(&idx_key) {
+        self.uncompacted += cmd_idx.len;
+      }
+      self.uncompacted += end - start;
+      
+      if COMPACTION_THRESHOLD < self.uncompacted {
+        self.compact()?;
+      }
+
+      Ok(())
+    } else {
+      Err(Error::from(ErrorKind::NotFound))
+    }
+  }
+```
+
+基本逻辑就是和单线程的操作是一样的，只不过是加入了线程共享变量，由于语言的特性，不了解的情况下比较难处理。  
+
+最后要操作的就是compact了：
+```rust
+n compact(&mut self) -> Result<()> {
+    let compaction_file_name = self.cur_data_file_name + 1;
+    let reader = &self.reader;
+    let mut readers_take = reader.readers.take();
+    let readers = readers_take.borrow_mut();
+    let mut compaction_writer = new_data_file(&self.data_path, compaction_file_name, readers)?;
+
+    let cur_data_file_name = compaction_file_name + 1;
+    self.writer = new_data_file(&self.data_path, cur_data_file_name, readers)?;
+    self.cur_data_file_name = cur_data_file_name;
+
+    let mut index = self.index.lock().unwrap();
+    for cmd_idx in index.values_mut() {
+      let (mut start, mut end) = (0,0);
+      reader.read_and(cmd_idx, |mut take| {
+        start = compaction_writer.pos;
+        copy(take.by_ref(), compaction_writer.by_ref())?;
+        end = compaction_writer.pos;
+        Ok(())
+      }).unwrap();
+      *cmd_idx = (compaction_file_name, start..end).into();
+    }
+    compaction_writer.flush()?;
+    self.uncompacted = 0;
+
+    self.reader.safe_point.store(compaction_file_name, Ordering::SeqCst);
+    self.reader.close_stale_handles();
+
+    let old_file_names = sorted_file_names(&self.data_path)?
+      .into_iter()
+      .filter(|&res| res < compaction_file_name);
+    for file_name in old_file_names {
+      fs::remove_file(data_file_path(&self.data_path, file_name)?)?;
+    }
+
+    Ok(())
+  }
+```
+它的逻辑就是根据`index`是的位置数据，从文件中读出指令，将它们写入新的文件中，然后清除旧文件。
